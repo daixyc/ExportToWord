@@ -1,0 +1,874 @@
+/******************************************************* 
+* 
+* 作者：代世雄 
+* 创建时间：2019/11/13 15:16:08
+* 运行环境：.NET 4.5 
+* 版本号：1.0.0 
+* 
+* 历史记录： 
+* 创建文件 代世雄 CONST 2019/11/13 15:16:08
+* 
+******************************************************/
+using AutoMapper;
+using ConST.CRM.BasicService;
+using ConST.CRM.Entities.Models;
+using ConST.CRM.Interface.Basic;
+using ConST.CRM.Interface.Contract;
+using ConST.CRM.Model.Company;
+using ConST.CRM.Model.Contract;
+using ConST.CRM.Model.Enum;
+using ConST.CRM.Utility.Helper;
+using NPOI;
+using NPOI.OpenXmlFormats.Wordprocessing;
+using NPOI.XWPF.UserModel;
+using Repository.Pattern.Repositories;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+
+namespace ConST.CRM.ContractService
+{
+    /// <summary>
+    /// 合同导出Word服务
+    /// </summary>
+    #region NPOI方式
+    public class ContractExportWordService : IContractExportWordService
+    {
+        #region 仓储
+        private readonly IRepositoryAsync<T_Base_Commpany> _repoCom;
+        private readonly IRepositoryAsync<T_Contract_TKDZ> _repoTK;
+        private readonly IRepositoryAsync<T_Contract_TermsSet> _repoTerm;
+        private readonly IRepositoryAsync<T_Contract_Terms> _repoTm;
+        private readonly IRepositoryAsync<T_Contract_Invoice> _repoInvoice;
+        private readonly IRepositoryAsync<T_Contract_Speed> _repoSpeed;
+        private readonly IRepositoryAsync<T_Org_User> _repoUser;
+        private readonly IBasicService _basicService;
+
+        public ContractExportWordService(IRepositoryAsync<T_Base_Commpany> repoCom,
+            IRepositoryAsync<T_Contract_TKDZ> repoTK,
+            IRepositoryAsync<T_Contract_TermsSet> repoTerm,
+            IRepositoryAsync<T_Org_User> repoUser,
+            IBasicService basicService,
+            IRepositoryAsync<T_Contract_Invoice> repoInvoice,
+            IRepositoryAsync<T_Contract_Speed> repoSpeed,
+            IRepositoryAsync<T_Contract_Terms> repoTm)
+        {
+            _repoCom = repoCom;
+            _repoTK = repoTK;
+            _repoTerm = repoTerm;
+            _repoUser = repoUser;
+            _basicService = basicService;
+            _repoInvoice = repoInvoice;
+            _repoSpeed = repoSpeed;
+            _repoTm = repoTm;
+        }
+        #endregion
+
+        /// <summary>
+        /// 合同导出Word
+        /// </summary>
+        /// <param name="model"></param>
+        /// <returns></returns>
+        public byte[] ExportWord(T_Contract model)
+        {
+            //替换关系
+            Dictionary<string, string> datas = GetDataMap(model);
+            var lstTerm = GetContractTerms(model);
+            byte[] wordData;
+
+            string tempFile = string.Format(@"{0}bin\Template\{1}", AppDomain.CurrentDomain.BaseDirectory, "销售合同模板.docx"); // 模板文件位置
+            string FileName = string.Format(@"{0}ContractFile\{1}", AppDomain.CurrentDomain.BaseDirectory, "销售合同.docx"); // 中间模板位置
+
+            try
+            {
+                XWPFDocument doc;
+                FileStream fs = File.OpenRead(tempFile);
+                doc = new XWPFDocument(fs);
+                fs.Close();
+                MemoryStream ms = new MemoryStream();
+
+                //1.替换段落对象
+                IList<XWPFParagraph> paragraphs = doc.Paragraphs;
+                foreach (var par in paragraphs)
+                {
+                    changeValue(par, datas);
+                }
+
+                //2.替换表格对象  其实只有一个表格了
+                //此处一个表格：① 标的物表 
+                IList<XWPFTable> tables = doc.Tables;
+                var lstProduct = model.T_Contract_Product.Where(p => p.IsGroup != true).ToList();
+
+                //2.1 标的物表格--特殊处理标的物行
+                XWPFTable proTable = tables[0];
+                //获取新增行的样式（产品表头）
+                XWPFTableRow rowTemp = proTable.GetRow(3);
+                //删除第三行样式行
+                proTable.RemoveRow(3);
+                //复制添加所有产品行
+                for (int i = 0; i < lstProduct.Count; i++)
+                {
+                    Copy(proTable, rowTemp, i + 3);
+
+                    Dictionary<string, string> productMap = GetProductMap(lstProduct[i]);
+                    XWPFTableRow row = proTable.GetRow(i + 3);
+                    eachTable(row, productMap);
+                }
+
+                //3. 添加条款
+                CT_P m_p = doc.Document.body.AddNewP();
+                GetTermPar(m_p, lstTerm, model, doc);
+
+                //4.因为条款段落问题，需要新建客户信息表
+                CreatCusTable(doc, datas, model.IsMiddleCustomer.Value);
+
+                //5. 新增段落，最后的日期
+                CT_P m_ctp = doc.Document.body.AddNewP();
+                m_ctp.AddNewPPr().AddNewJc().val = ST_Jc.right;//段落水平居右
+                XWPFParagraph gp = new XWPFParagraph(m_ctp, doc); //创建XWPFParagraph
+                XWPFRun gr = gp.CreateRun();
+                gr.GetCTR().AddNewRPr().AddNewRFonts().ascii = "等线";
+                gr.GetCTR().AddNewRPr().AddNewRFonts().eastAsia = "等线";
+                gr.GetCTR().AddNewRPr().AddNewRFonts().hint = ST_Hint.eastAsia;
+                gr.GetCTR().AddNewRPr().AddNewSz().val = (ulong)22;//字体
+                gr.GetCTR().AddNewRPr().AddNewSzCs().val = (ulong)22;
+                gr.GetCTR().AddNewRPr().AddNewB().val = true;//加粗
+
+                gr.SetText("有效期限： ${vailDate}$");
+                gp = changeValue(gp, datas);
+
+                //6 全部替换--其实这里只有标的物表头是需要替换的了
+                foreach (var table in tables)
+                {
+                    IList<XWPFTableRow> rows = table.Rows;
+                    //遍历表格，并替换
+                    foreach (var row in rows)
+                    {
+                        eachTable(row, datas);
+                    }
+                }
+
+                doc.Write(ms);
+
+                //通过中间文件进行导出。直接导出文件-->打开报错
+                using (FileStream filestream = new FileStream(FileName, FileMode.Create, FileAccess.Write))
+                {
+                    wordData = ms.ToArray();
+                    filestream.Write(wordData, 0, wordData.Length);
+                    filestream.Flush();
+
+                    ms.Close();
+
+                }
+                File.Delete(FileName);
+            }
+            catch (Exception ex)
+            {
+                wordData = new byte[0];
+            }
+            return wordData;
+        }
+
+        /// <summary>
+        /// 设置条款段落的文字及样式
+        /// </summary>
+        /// <param name="paragraph"></param>
+        /// <param name="lstTerm"></param>
+        /// <param name="model"></param>
+        /// <returns></returns>
+        private void GetTermPar(CT_P paragraph, List<ContractTermSetDTO> lstTerm, T_Contract model,XWPFDocument doc)
+        {
+            XWPFParagraph par = new XWPFParagraph(paragraph, doc);
+            paragraph.AddNewPPr().AddNewSpacing().line = "400";
+            paragraph.AddNewPPr().AddNewSpacing().lineRule = ST_LineSpacingRule.exact;
+            foreach (var term in lstTerm.Where(p=>p.SEQ!=1))
+            {
+                string str = GetParagraphStr(model, term);//条款信息
+                XWPFRun xwpfRun = par.CreateRun();
+                xwpfRun.SetText(str);
+                xwpfRun.FontSize = 11;
+                xwpfRun.SetFontFamily("等线", FontCharRange.None);
+                xwpfRun.IsBold = true;
+                xwpfRun.AddCarriageReturn();
+            }
+        }
+
+        /// <summary>
+        /// 创建客户信息表
+        /// </summary>
+        /// <param name="doc"></param>
+        private void CreatCusTable(XWPFDocument doc,Dictionary<string,string> datas,bool IsMiddleCustomer)
+        {
+            //创建Table,只包含两行不含合并单元格行
+            CT_Tbl m_CTTbl = doc.Document.body.AddNewTbl();
+            XWPFTable cusTable = new XWPFTable(m_CTTbl, doc, 2, 4);
+            //2.1 设置表格样式
+            m_CTTbl.AddNewTblPr().jc = new CT_Jc();
+            m_CTTbl.AddNewTblPr().jc.val = ST_Jc.center;//表在页面水平居中
+            m_CTTbl.AddNewTblPr().AddNewTblW().w = "10480";//表宽度
+            m_CTTbl.AddNewTblPr().AddNewTblW().type = ST_TblWidth.dxa;
+
+            //添加合并单元格的行
+            //第一行 - 三行
+            for(int i = 0; i < 3; i++)
+            {
+                XWPFTableRow m_Row = cusTable.InsertNewTableRow(i);
+                for (int q = 0; q < 2; q++)
+                {
+                    XWPFTableCell cell = m_Row.CreateCell();
+                    CT_Tc cttc = cell.GetCTTc();
+                    CT_TcPr ctPr = cttc.AddNewTcPr();
+                    ctPr.gridSpan = new CT_DecimalNumber();
+                    ctPr.gridSpan.val = "2"; //合并2列
+                    if (i == 0)//第一行水平居中
+                    {
+                        cttc.GetPList()[0].AddNewPPr().AddNewJc().val = ST_Jc.center;
+                    }
+                }
+                int hight = 430;
+                if (i == 1)
+                    hight = 1128;
+                m_Row.GetCTRow().AddNewTrPr().AddNewTrHeight().val = (ulong)hight;
+                
+            }
+            //第五行单独添加
+            XWPFTableRow m_Row5 = cusTable.InsertNewTableRow(4);//固定行插入
+            XWPFTableCell cell1 = m_Row5.CreateCell();
+            XWPFTableCell cell2 = m_Row5.CreateCell();
+            XWPFTableCell cell3 = m_Row5.CreateCell();
+            CT_Tc cttc3 = cell3.GetCTTc();
+            CT_TcPr ctPr3 = cttc3.AddNewTcPr();
+            ctPr3.gridSpan = new CT_DecimalNumber();
+            ctPr3.gridSpan.val = "2"; //合并2列
+            for (int i = 3; i < 6; i++)  //四五六行行高设置
+            {
+                cusTable.GetRow(i).GetCTRow().AddNewTrPr().AddNewTrHeight().val = (ulong)660;
+            }
+            //七八九行创建
+            for (int i = 6; i < 9; i++)
+            {
+                CT_Row m_NewRow = new CT_Row();
+                XWPFTableRow m_Row = new XWPFTableRow(m_NewRow, cusTable);
+                cusTable.AddRow(m_Row);
+                //XWPFTableRow m_Row = cusTable.CreateRow();
+                for (int q = 0; q < 2; q++)
+                {
+                    XWPFTableCell cell = m_Row.CreateCell();
+                    CT_Tc cttc = cell.GetCTTc();
+                    CT_TcPr ctPr = cttc.AddNewTcPr();
+                    ctPr.gridSpan = new CT_DecimalNumber();
+                    ctPr.gridSpan.val = "2"; //合并2列
+                }
+                m_Row.GetCTRow().AddNewTrPr().AddNewTrHeight().val = (ulong)500;
+            }
+            //最后两行创建，要合并的
+            CT_Row m_NewRow9 = new CT_Row();
+            XWPFTableRow m_Row9 = new XWPFTableRow(m_NewRow9, cusTable);
+            m_Row9.GetCTRow().AddNewTrPr().AddNewTrHeight().val = (ulong)500;
+            cusTable.AddRow(m_Row9);
+            //XWPFTableRow m_Row9 = cusTable.CreateRow();
+            XWPFTableCell cell9 = m_Row9.CreateCell();
+            CT_Tc cttc9 = cell9.GetCTTc();
+            CT_TcPr ctPr9 = cttc9.AddNewTcPr();
+            ctPr9.gridSpan = new CT_DecimalNumber();
+            ctPr9.gridSpan.val = "2";//合并两列
+            ctPr9.AddNewVMerge().val = ST_Merge.restart;//合并行
+            //不合并的
+            cell9 = m_Row9.CreateCell();
+            cttc9 = cell9.GetCTTc();
+            ctPr9 = cttc9.AddNewTcPr();
+            ctPr9.gridSpan = new CT_DecimalNumber();
+            ctPr9.gridSpan.val = "2"; //合并两列  
+            ctPr9.AddNewVAlign().val = ST_VerticalJc.center;
+
+            //是中间商才会创建最后一行
+            if (IsMiddleCustomer)
+            {
+                CT_Row m_NewRow10 = new CT_Row();
+                XWPFTableRow m_Row10 = new XWPFTableRow(m_NewRow10, cusTable);
+                m_Row10.GetCTRow().AddNewTrPr().AddNewTrHeight().val = (ulong)500;
+                cusTable.AddRow(m_Row10);
+                //XWPFTableRow m_Row9 = cusTable.CreateRow();
+                XWPFTableCell cell10 = m_Row10.CreateCell();
+                CT_Tc cttc10 = cell10.GetCTTc();
+                CT_TcPr ctPr10 = cttc10.AddNewTcPr();
+                ctPr10.gridSpan = new CT_DecimalNumber();
+                ctPr10.gridSpan.val = "2";//合并两列
+                ctPr10.AddNewVMerge().val = ST_Merge.@continue;//合并行
+                                                               //不合并的
+                cell10 = m_Row10.CreateCell();
+                cttc10 = cell10.GetCTTc();
+                ctPr10 = cttc10.AddNewTcPr();
+                ctPr10.gridSpan = new CT_DecimalNumber();
+                ctPr10.gridSpan.val = "2"; //合并两列  
+                ctPr10.AddNewVAlign().val = ST_VerticalJc.center;
+            }
+            
+            FillWord(cusTable, doc,datas,IsMiddleCustomer);
+        }
+
+        /// <summary>
+        /// 为最后的表格填充文字
+        /// </summary>
+        /// <param name="table"></param>
+        private void FillWord(XWPFTable table,XWPFDocument doc,Dictionary<string,string> datas,bool IsMiddleCustomer)
+        {
+            //第一行
+            table.GetRow(0).GetCell(0).SetParagraph(SetCellText(doc, table, "出 卖 人",datas));
+            table.GetRow(0).GetCell(1).SetParagraph(SetCellText(doc, table, "买 受 人", datas));
+            //第二行
+            table.GetRow(1).GetCell(0).SetParagraph(SetCellText(doc, table, "单位名章：${companyName}$", datas));
+            table.GetRow(1).GetCell(1).SetParagraph(SetCellText(doc, table, "单位名章： ${customerName}$", datas));
+            //第三行
+            table.GetRow(2).GetCell(0).SetParagraph(SetCellText(doc, table, "地址：${companyAddress}$", datas));
+            table.GetRow(2).GetCell(1).SetParagraph(SetCellText(doc, table, "地址：${customerAddress}$", datas));
+            //第四行
+            table.GetRow(3).GetCell(0).SetParagraph(SetCellText(doc, table, "法定代表人：${companyFaren}$", datas));
+            table.GetRow(3).GetCell(1).SetParagraph(SetCellText(doc, table, "委托代理人： ${companyWeituo}$", datas));
+            table.GetRow(3).GetCell(2).SetParagraph(SetCellText(doc, table, "法定代表人：${customerFaren}$", datas));
+            table.GetRow(3).GetCell(3).SetParagraph(SetCellText(doc, table, "委托代理人： ${customerWeituo}$", datas));
+            //第五行
+            table.GetRow(4).GetCell(0).SetParagraph(SetCellText(doc, table, "联系电话：${companyPhone}$", datas));
+            table.GetRow(4).GetCell(1).SetParagraph(SetCellText(doc, table, "手机：${comPersonPhone}$", datas));
+            table.GetRow(4).GetCell(2).SetParagraph(SetCellText(doc, table, "联系电话：${customerPhone}$", datas));
+            //第六行
+            table.GetRow(5).GetCell(0).SetParagraph(SetCellText(doc, table, "注册电话：${conpanyRegTel}$", datas));
+            table.GetRow(5).GetCell(1).SetParagraph(SetCellText(doc, table, "邮政编码：${companyZipCode}$", datas));
+            table.GetRow(5).GetCell(2).SetParagraph(SetCellText(doc, table, "注册电话： ${customerRegTel}$", datas));
+            table.GetRow(5).GetCell(3).SetParagraph(SetCellText(doc, table, "邮政编码：${customerZipCode}$", datas));
+            //第七行
+            table.GetRow(6).GetCell(0).SetParagraph(SetCellText(doc, table, "传真电话：${companyFax}$", datas));
+            table.GetRow(6).GetCell(1).SetParagraph(SetCellText(doc, table, "传真电话：${customerFax}$", datas));
+            //第八行
+            table.GetRow(7).GetCell(0).SetParagraph(SetCellText(doc, table, "开户银行：${companyBank}$", datas));
+            table.GetRow(7).GetCell(1).SetParagraph(SetCellText(doc, table, "开户银行： ${customerBank}$", datas));
+            //第九行
+            table.GetRow(8).GetCell(0).SetParagraph(SetCellText(doc, table, "账号：${companyAccount}$", datas));
+            table.GetRow(8).GetCell(1).SetParagraph(SetCellText(doc, table, "账号：${customerAccount}$", datas));
+            //第十行
+            table.GetRow(9).GetCell(0).SetParagraph(SetCellText(doc, table, "税号：${companyTax}$", datas));
+            table.GetRow(9).GetCell(1).SetParagraph(SetCellText(doc, table, "税号：${customerTax}$", datas));
+            //第十一行
+            if (IsMiddleCustomer)
+            {
+                table.GetRow(10).GetCell(1).SetParagraph(SetCellText(doc, table, "最终用户：${cusName1}$", datas));
+            }
+
+        }
+
+        /// <summary>
+        /// 单元格填充文字
+        /// </summary>
+        /// <param name="doc"></param>
+        /// <param name="table"></param>
+        /// <param name="setText"></param>
+        /// <returns></returns>
+        public XWPFParagraph SetCellText(XWPFDocument doc, XWPFTable table, string setText,Dictionary<string,string> datas)
+        {
+            //table中的文字格式设置  
+            CT_P para = new CT_P();
+            XWPFParagraph pCell = new XWPFParagraph(para, table.Body);
+            if(setText.Contains("出 卖") || setText.Contains("买 受"))
+            {
+                pCell.Alignment = ParagraphAlignment.CENTER;//字体居中  
+                pCell.VerticalAlignment = TextAlignment.CENTER;//字体居中 
+            }
+
+            XWPFRun r1c1 = pCell.CreateRun();
+            r1c1.SetText(setText);
+            r1c1.IsBold = true;
+            r1c1.FontSize = 11;
+            r1c1.FontFamily = "等线";
+            var result = changeValue(pCell, datas);
+            return result;
+        }
+
+        /// <summary>
+        /// 获取替换对照关系
+        /// </summary>
+        /// <param name="contractModel"></param>
+        /// <returns></returns>
+        private Dictionary<string, string> GetDataMap(T_Contract contractModel)
+        {
+            //发货地址
+            string deliverStr = string.Empty;
+            if (contractModel.T_Contract_Express != null && contractModel.T_Contract_Express.Count != 0)
+            {
+                var deliverList = contractModel.T_Contract_Express.Select(p => p.DeliverAdd);
+                if (deliverList != null) deliverStr = string.Join(";", deliverList.ToArray());
+            }
+
+            //公司信息
+            var companyList = _repoCom.GetAll();
+            var companyInfo = _basicService.GetCompanyInfo(companyList);
+            //委托人电话
+            var mobile = "";
+            var user = _repoUser.GetById(contractModel.ContractPerson);
+            if (user != null) mobile = user.MobilePhone;
+            #region 获取发票信息
+            string InvoicePhone = string.Empty;
+            string InvoiceBank = string.Empty;
+            string InvoiceBankAccount = string.Empty;
+            string TaxCode = string.Empty;
+            if (contractModel.InvoiceId != 0 && contractModel.InvoiceId != null)
+            {
+                var invoice = _repoInvoice.GetById(contractModel.InvoiceId);
+                InvoicePhone = invoice.InvoicePhone;
+                InvoiceBank = invoice.InvoiceBank;
+                InvoiceBankAccount = invoice.InvoiceBankAccount;
+                TaxCode = invoice.TaxCode;
+            }
+            #endregion
+            var terms = GetContractTerms(contractModel);
+            string productHeadStr = NumberChange((int)terms[0].SEQ) + "、" + terms[0].Provision;
+
+            Dictionary<string, string> datas = new Dictionary<string, string>();
+            //1.1第一表格--头部信息
+            //datas.Add("${term}$",str);
+            datas.Add("${contractCode}", contractModel.ContractCode);
+            datas.Add("${contractDate}$", contractModel.ContractDate.GetValueOrDefault().ToString("yyyy年MM月dd日"));
+            datas.Add("${address}$", contractModel.ContractAddress);
+            datas.Add("${productHeadStr}$", productHeadStr);
+            datas.Add("${amount}$", GetNormalNum(contractModel.TotalAmount.ToString()));
+            datas.Add("${allAmount}$", CommonHelper.gMoney(Convert.ToDouble(contractModel.TotalAmount)));
+            //1.2 第一表格--标的物信息
+            //2.文字章程
+            datas.Add("${deliveAddress}$", deliverStr);
+            datas.Add("${deliveType}$", contractModel.ExpressWay);
+            datas.Add("${cusName1}$", contractModel.CusName1);
+            //3.1第二表格--公司信息
+            datas.Add("${companyName}$", companyInfo.CompanyAllName);
+            datas.Add("${companyAddress}$", companyInfo.RegAddr);
+            datas.Add("${companyFaren}$", companyInfo.LegalRepresPerson);
+            datas.Add("${companyPhone}$", companyInfo.Tel);
+            datas.Add("${conpanyRegTel}$", companyInfo.RegTel);
+            datas.Add("${companyFax}$", companyInfo.Fax);
+            datas.Add("${companyBank}$", companyInfo.Bank);
+            datas.Add("${companyAccount}$", companyInfo.Account);
+            datas.Add("${companyTax}$", companyInfo.TaxCode);
+            datas.Add("${companyZipCode}$", companyInfo.ZipCode);
+            datas.Add("${companyWeituo}$", contractModel.ContractPersonName);
+            datas.Add("${comPersonPhone}$", mobile);//委托人电话
+            //3.2第二表格--客户信息
+            datas.Add("${customerName}$", contractModel.CusName);
+            datas.Add("${customerAddress}$", contractModel.CusAddress);
+            datas.Add("${customerFaren}$", contractModel.CusLPerson);
+            datas.Add("${customerWeituo}$", "");//去掉客户的委托代理人赋值
+            datas.Add("${customerPhone}$", contractModel.LinkPhone);
+            datas.Add("${customerRegTel}$", InvoicePhone);//注册电话
+            datas.Add("${customerZipCode}$", contractModel.CusPostCode);
+            datas.Add("${customerFax}$", contractModel.CusFax);
+            datas.Add("${customerBank}$", InvoiceBank);//注册银行
+            datas.Add("${customerAccount}$", InvoiceBankAccount);//注册账号
+            datas.Add("${customerTax}$", TaxCode);//注册税号
+
+            datas.Add("${vailDate}$", contractModel.ContractVailStartDate.GetValueOrDefault().ToString("yyyy年MM月dd日") + "至" + contractModel.ContractVailEndDate.GetValueOrDefault().ToString("yyyy年MM月dd日"));
+
+            return datas;
+        }
+
+        /// <summary>
+        /// 获取标的物替换关系
+        /// </summary>
+        /// <param name="productModel"></param>
+        /// <returns></returns>
+        private Dictionary<string, string> GetProductMap(T_Contract_Product productModel)
+        {
+            Dictionary<string, string> map = new Dictionary<string, string>();
+            map.Add("${ItemName}$", productModel.ItemName);
+            map.Add("${ProductName}$", productModel.InvStd);
+            map.Add("${InvStd}$", productModel.InvStdOut);
+            map.Add("${Unit}$", productModel.Unit);
+            map.Add("${ItemNumber}$", GetNormalNum(productModel.ItemNumber.ToString()));
+            map.Add("${TotalAmount}$", GetNormalNum(productModel.TotalAmount.ToString()));
+            return map;
+        }
+
+        /// <summary>
+        /// 获取商务专员负责人
+        /// </summary>
+        /// <returns></returns>
+        private string GetSwzyName(T_Contract contractModel)
+        {
+            string name = "";
+            if (contractModel.ContractSpeed != (int)ContractSpeedEnum.Draft && contractModel.ContractSpeed != (int)ContractSpeedEnum.AuditOne &&
+                contractModel.ContractSpeed != (int)ContractSpeedEnum.AuditLoading && contractModel.ContractSpeed != (int)ContractSpeedEnum.AuditBH
+                && contractModel.ContractSpeed != (int)ContractSpeedEnum.AuditTH)
+            {
+                var speed = _repoSpeed.GetBy(p => p.ContractId == contractModel.Id);
+                var second = speed.Where(p => p.Speed == (int)ContractSpeedEnum.AuditTwo).OrderByDescending(p => p.SpeedDate).FirstOrDefault();
+                if (second != null)
+                {
+                    name = second.SpeedUser;
+                }
+            }
+            return name;
+        }
+
+        ///判断文本中是否包含$
+        /// @param text 文本
+        ///@return 包含返回true,不包含返回false
+        private bool checkText(String text)
+        {
+            bool check = false;
+            if (text.Contains("${"))
+            {
+                check = true;
+            }
+            return check;
+
+        }
+
+        /// 遍历表格
+        ///@param rows 表格行对象
+        ///@param textMap 需要替换的信息集合
+        private void eachTable(XWPFTableRow row, Dictionary<String, String> textMap)
+        {
+            List<XWPFTableCell> cells = row.GetTableCells();
+            foreach (var cell in cells)
+            {
+                //是否需要替换，是则替换
+                if (checkText(cell.GetText()))
+                {
+                    //表格内的每格都是一个段落
+                    IList<XWPFParagraph> paragraphs = cell.Paragraphs;
+                    foreach (var par in paragraphs)
+                    {
+                        changeValue(par, textMap);
+                    }
+                }
+            }
+        }
+
+        ///匹配传入信息集合与模板
+        /// @param value 模板需要替换的区域
+        /// @param textMap 传入信息集合
+        ///@return 模板需要替换区域信息集合对应值
+        private XWPFParagraph changeValue(XWPFParagraph paragraph, Dictionary<String, String> textMap)
+        {
+            string par = paragraph.Text;
+            try
+            {
+                foreach (var date in textMap)
+                {
+                    string oldPar = paragraph.Text;
+                    if (par.Contains(date.Key))
+                    {
+                        par = par.Replace(date.Key, date.Value);
+                        paragraph.ReplaceText(oldPar, par);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                return paragraph;
+            }
+            return paragraph;
+        }
+
+        /// <summary>
+        /// 复制行
+        /// </summary>
+        /// <param name="table"></param>
+        /// <param name="sourceRow"></param>
+        /// <param name="rowIndex"></param>
+        private void Copy(XWPFTable table, XWPFTableRow sourceRow, int rowIndex)
+        {
+            //在表格指定位置新增一行
+            XWPFTableRow targetRow = table.InsertNewTableRow(rowIndex);
+            //复制行属性
+            targetRow.GetCTRow().trPr = sourceRow.GetCTRow().trPr;
+            List<XWPFTableCell> cellList = sourceRow.GetTableCells();
+            if (cellList == null || cellList.Count <= 0)
+            {
+                return;
+            }
+            //复制列及其属性和内容
+            XWPFTableCell targetCell = null;
+            foreach (var sourceCell in cellList)
+            {
+                targetCell = targetRow.AddNewTableCell();
+                //列属性
+                targetCell.GetCTTc().tcPr = sourceCell.GetCTTc().tcPr;
+                //段落属性
+                if (sourceCell.Paragraphs != null && sourceCell.Paragraphs.Count > 0)
+                {
+                    targetCell.Paragraphs[0].Alignment = ParagraphAlignment.CENTER;
+                    if (sourceCell.Paragraphs[0].Runs != null && sourceCell.Paragraphs[0].Runs.Count > 0)
+                    {
+                        XWPFRun cellR = targetCell.Paragraphs[0].CreateRun();
+                        cellR.SetText(sourceCell.GetText());
+                        cellR.IsBold = true;
+                    }
+                    else
+                    {
+                        targetCell.SetText(sourceCell.GetText());
+                    }
+                }
+                else
+                {
+                    targetCell.SetText(sourceCell.GetText());
+                }
+            }
+        }
+
+        /// <summary>
+        /// 转化数字格式
+        /// </summary>
+        /// <param name="number"></param>
+        /// <returns></returns>
+        private string GetNormalNum(string number)
+        {
+            string result = "";
+            decimal midNum = decimal.Parse(number);
+            string midStr = Math.Round((midNum * 100), 2).ToString();
+            if (midStr.Contains(".00"))
+            {
+                decimal num = Math.Round(midNum, 2);
+                result = num.ToString();
+            }
+            else
+            {
+                //正则匹配最后一位是否为0
+                string patt1 = @".*[\\0]$";
+                //1.2650  去掉最后一位0
+                if (Regex.IsMatch(midStr, patt1))
+                    midStr = midStr.Substring(0, midStr.Length - 1);
+                //1.2653
+                decimal num = decimal.Parse(midStr) / 100;
+                result = num.ToString();
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// 数字转换 
+        /// </summary>
+        /// <param name="num"></param>
+        public string NumberChange(int num)
+        {
+            string result = string.Empty;
+            string[] charList = new string[11] { "零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十" };
+            var numLen = num.ToString().Length;
+            if (numLen == 1)
+            {
+                result = charList[num];
+            }
+            else if (numLen == 2)
+            {
+                //顶多也就两位
+                var charArr = num.ToString().ToCharArray();
+                string deciles = string.Empty;
+                string singles = string.Empty;
+                if (charArr[0] == '1')
+                {
+                    deciles = "十";
+                }
+                else
+                {
+                    deciles = charList[int.Parse(charArr[0].ToString())] + "十";
+                }
+                if (charArr[1] != '0')
+                {
+                    singles = charList[int.Parse(charArr[1].ToString())];
+                }
+                result = deciles + singles;
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// 获取小数点后一位
+        /// </summary>
+        /// <param name=""></param>
+        /// <returns></returns>
+        public string GetDotNum(decimal num)
+        {
+            var arr = num.ToString().Split('.');
+            return arr[1];
+        }
+
+        /// <summary>
+        /// 获取替换后的条款
+        /// </summary>
+        /// <param name="term"></param>
+        /// <returns></returns>
+        public string GetProvision(T_Contract_TermsSet term, T_Contract model, string type)
+        {
+            string result = string.Empty;
+            switch (term.BindData)
+            {
+                case "zlbz":  //质量标准
+                    result = term.Provision.Replace("依据国家标准或检定规程（校准规范）", GetQualityStandard(model, type));
+                    break;
+                case "LeadTime"://交货时间
+                    var deliveTime = "";
+                    if (model.PayType == "款到发货")
+                    {
+                        deliveTime = "收到全款后" + model.LeadTime + "个工作日内发货";
+                    }
+                    else if (model.PayType == "货到付款")
+                    {
+                        deliveTime = "合同生效后" + model.LeadTime + "个工作日内发货";
+                    }
+                    else//分期付款
+                    {
+                        deliveTime = model.DeliverContent;//交货时间说明
+                    }
+                    result = term.Provision.Replace("全款到帐后七个工作日内发货", deliveTime);
+                    break;
+                case "deliveAddress": //交货地点
+                    string deliverStr = string.Empty;
+                    if (model.T_Contract_Express != null && model.T_Contract_Express.Count != 0)
+                    {
+                        var deliverList = model.T_Contract_Express.Select(p => p.DeliverAdd);
+                        if (deliverList != null) deliverStr = string.Join(";", deliverList.ToArray());
+                    }
+                    if (!string.IsNullOrEmpty(deliverStr))
+                    {
+                        result = term.Provision.Replace("用户指定地点，以传真为准", deliverStr);
+                    }
+                    else
+                        result = term.Provision;
+                    break;
+                case "deliveType":  //交货方式
+                    result = term.Provision.Replace("中铁快运", model.ExpressWay);
+                    break;
+                case "deliveTypeAddress"://交货方式及地点
+                    result = term.Provision.Replace("中铁快运", model.ExpressWay);
+                    string deliver = string.Empty;
+                    if (model.T_Contract_Express != null && model.T_Contract_Express.Count != 0)
+                    {
+                        var deliverList = model.T_Contract_Express.Select(p => p.DeliverAdd);
+                        if (deliverList != null) deliverStr = string.Join(";", deliverList.ToArray());
+                    }
+                    if (!string.IsNullOrEmpty(deliver))
+                    {
+                        result = result.Replace("用户指定地点，以传真为准", deliver);
+                    }
+                    break;
+                case "MoneyType"://支付方式
+                    result = term.Provision.Replace("银行汇款", model.MoneyType);
+                    break;
+                case "payType"://付款方式
+                    //支付方式
+                    string payType = string.Empty;
+                    if (model.PayType == "款到发货") payType = "款到发货";
+                    else if (model.PayType == "货到付款") payType = "货到付款:" + model.PayTime;
+                    else if (model.PayType == "分期付款") payType = "分期付款:" + model.PayNeed;
+                    result = term.Provision.Replace("款到发货", payType);
+                    break;
+                case "swzyName"://商务专员姓名
+                    var auditor = model.T_Contract_OperationLog.Where(p => p.OperType == 3).OrderByDescending(p => p.Id).FirstOrDefault();
+                    if (auditor != null)
+                    {
+                        result = term.Provision.Replace("负责内勤人员姓名", auditor.OperPerson);
+                    }
+                    else
+                        result = term.Provision;
+                    break;
+                case "cusName1"://最终用户
+                    result = term.Provision.Replace("最终用户名称", model.CusName1);
+                    break;
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// 获取条款对照
+        /// </summary>
+        /// <param name="model"></param>
+        /// <returns></returns>
+        private string GetQualityStandard(T_Contract model, string type)
+        {
+            string result = string.Empty;
+            var productcode = model.T_Contract_Product.Where(p => p.IsGroup != true).Select(p => p.ProductName).Distinct();
+            var list = _repoTK.GetBy(p => productcode.Contains(p.TTYpe)).Select(p => p.TName).Distinct();
+            if (list.ToList().Count != 0) result = string.Join(",", list.ToArray());
+            if (type == "pdf")
+                result = result.Replace("<", "&lt;").Replace(">", "&gt;");
+
+            result += string.IsNullOrEmpty(result)? "依据国家标准或检定规程（校准规范）" : "，依据国家标准或检定规程（校准规范）";
+            return result;
+        }
+
+        /// <summary>
+        /// 获取当前合同的条款
+        /// </summary>
+        /// <param name="model"></param>
+        /// <returns></returns>
+        private List<ContractTermSetDTO> GetContractTerms(T_Contract model)
+        {
+            var list = _repoTerm.GetBy(p => p.ContractId == model.Id).OrderBy(p => p.SEQ).ToList();
+            List<ContractTermSetDTO> listModel = new List<ContractTermSetDTO>();
+            if (list.Count == 0)
+            {
+                var termList = _repoTm.GetAll().OrderBy(p => p.SEQ).ToList();
+                if (model.IsMiddleCustomer == false)
+                {
+                    termList.Remove(termList.Where(p => p.BindData == "cusName1").FirstOrDefault());
+                }
+                foreach (var item in termList)
+                {
+                    ContractTermSetDTO dto = new ContractTermSetDTO()
+                    {
+                        Id = item.Id,
+                        SEQ = item.SEQ,
+                        IsParent = item.IsParent,
+                        Provision = item.Provision,
+                        ParentId = item.ParentId,
+                        BindData = item.BindData,
+                        ContractId = model.Id
+                    };
+                    listModel.Add(dto);
+                }
+            }
+            else
+            {
+                if (model.IsMiddleCustomer == false)
+                {
+                    list.Remove(list.Where(p => p.BindData == "cusName1").FirstOrDefault());
+                }
+                listModel = Mapper.Map<List<ContractTermSetDTO>>(list);
+            }
+            return listModel;
+        }
+
+        /// <summary>
+        /// 拼接条款
+        /// </summary>
+        /// <param name="model"></param>
+        /// <param name="term"></param>
+        /// <returns></returns>
+        private string GetParagraphStr(T_Contract model, ContractTermSetDTO term)
+        {
+            string str = string.Empty;
+            if (term.BindData != null)
+            {
+                var termSet = Mapper.Map<T_Contract_TermsSet>(term);
+                term.Provision = GetProvision(termSet, model, "word");
+            }
+            if (term.SEQ != 1) //第一条是标的物头，不可变
+            {
+                if (term.IsParent)
+                {
+                    str += NumberChange((int)term.SEQ) + "、" + term.Provision ;
+                }
+                else
+                {
+                    str += GetDotNum(term.SEQ) + "、" + term.Provision ;
+                }
+            }
+           
+            return str;
+        }
+    }
+    #endregion
+
+}
+
